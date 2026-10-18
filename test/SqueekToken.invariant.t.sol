@@ -24,7 +24,7 @@ contract SqueekHandler is Test {
         address from = actors[fromSeed % actors.length];
         address to = actors[toSeed % actors.length];
         uint256 held = expectedBalance[from];
-        uint256 amount = overspend ? held + 1 : bound(amountSeed, 0, held);
+        uint256 amount = overspend ? bound(amountSeed, held + 1, type(uint256).max) : bound(amountSeed, 0, held);
 
         if (overspend) {
             vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, from, held, amount));
@@ -39,10 +39,15 @@ contract SqueekHandler is Test {
         expectedBalance[to] += amount;
     }
 
-    function approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amountSeed, bool unlimited) external {
+    function approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amountSeed, uint8 kind) external {
         address owner = actors[ownerSeed % actors.length];
         address spender = actors[spenderSeed % actors.length];
-        uint256 amount = unlimited ? type(uint256).max : bound(amountSeed, 0, 1_000_000_000 ether);
+        // Include revocation, unlimited approval, full-width finite values, and
+        // small allowances that can be exhausted while the owner still has funds.
+        uint256 amount;
+        if (kind % 4 == 1) amount = type(uint256).max;
+        else if (kind % 4 == 2) amount = amountSeed;
+        else if (kind % 4 == 3) amount = bound(amountSeed, 0, 1_000_000_000 ether);
 
         vm.prank(owner);
         assertTrue(token.approve(spender, amount));
@@ -58,7 +63,8 @@ contract SqueekHandler is Test {
         uint256 held = expectedBalance[owner];
         uint256 approved = expectedAllowance[owner][spender];
         uint256 available = held < approved ? held : approved;
-        uint256 amount = overspend ? available + 1 : bound(amountSeed, 0, available);
+        uint256 amount =
+            overspend ? bound(amountSeed, available + 1, type(uint256).max) : bound(amountSeed, 0, available);
 
         if (overspend) {
             if (amount > approved) {
@@ -83,8 +89,41 @@ contract SqueekHandler is Test {
             expectedAllowance[owner][spender] -= amount;
         }
     }
+
+    /// @dev Rejected calls leave the ghost ledger untouched, so both invariants
+    /// check that every balance and approval survives the failed transaction.
+    function invalidAddress(uint256 ownerSeed, uint256 spenderSeed, uint256 amountSeed, uint8 kind) external {
+        address owner = actors[ownerSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+
+        if (kind % 4 == 0) {
+            vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+            vm.prank(owner);
+            token.transfer(address(0), amountSeed);
+        } else if (kind % 4 == 1) {
+            vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidSpender.selector, address(0)));
+            vm.prank(owner);
+            token.approve(address(0), amountSeed);
+        } else if (kind % 4 == 2) {
+            uint256 held = expectedBalance[owner];
+            uint256 approved = expectedAllowance[owner][spender];
+            uint256 amount = bound(amountSeed, 0, held < approved ? held : approved);
+            vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+            vm.prank(spender);
+            token.transferFrom(owner, address(0), amount);
+        } else {
+            // The zero owner may be rejected during allowance validation before
+            // sender validation. Require rejection without prescribing that order.
+            vm.expectRevert();
+            vm.prank(spender);
+            token.transferFrom(address(0), owner, 0);
+        }
+    }
 }
 
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 128
+/// forge-config: default.invariant.fail-on-revert = true
 contract SqueekTokenInvariantTest is Test {
     SqueekToken internal token;
     SqueekHandler internal handler;
@@ -94,10 +133,11 @@ contract SqueekTokenInvariantTest is Test {
         handler = new SqueekHandler(token);
         token.transfer(handler.actors(0), 1_000_000_000 ether);
 
-        bytes4[] memory selectors = new bytes4[](3);
+        bytes4[] memory selectors = new bytes4[](4);
         selectors[0] = handler.transfer.selector;
         selectors[1] = handler.approve.selector;
         selectors[2] = handler.transferFrom.selector;
+        selectors[3] = handler.invalidAddress.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -120,11 +160,29 @@ contract SqueekTokenInvariantTest is Test {
 
     function invariant_allowancesMatchIndependentLedger() public view {
         for (uint256 i; i < 4; ++i) {
+            assertEq(token.allowance(handler.actors(i), address(0)), 0);
+            assertEq(token.allowance(address(0), handler.actors(i)), 0);
             for (uint256 j; j < 4; ++j) {
                 address owner = handler.actors(i);
                 address spender = handler.actors(j);
                 assertEq(token.allowance(owner, spender), handler.expectedAllowance(owner, spender));
             }
         }
+    }
+
+    /// @dev After each random sequence, every holder must still be able to move
+    /// its whole balance out and back. The round trip preserves the ghost ledger.
+    function afterInvariant() public {
+        for (uint256 i; i < 4; ++i) {
+            address actor = handler.actors(i);
+            uint256 held = handler.expectedBalance(actor);
+            vm.prank(actor);
+            assertTrue(token.transfer(address(this), held));
+            assertEq(token.balanceOf(actor), 0);
+            assertEq(token.balanceOf(address(this)), held);
+            assertTrue(token.transfer(actor, held));
+        }
+        invariant_supplyAndBalancesMatchIndependentLedger();
+        invariant_allowancesMatchIndependentLedger();
     }
 }
